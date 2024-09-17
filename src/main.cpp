@@ -226,6 +226,10 @@ void ym_play(uint8_t chip, uint8_t channel, uint16_t note) {
   ym_write_reg(chip, 0x28, 0xF0 + channel + (channel > 2 ? 1 : 0)); // Key on
 }
 
+uint16_t getNote(uint8_t octave, uint16_t fnum) {
+  return ((octave & 7) << 11) | (fnum & 0x7ff);
+}
+
 void ym_test() {
   //mode_2612 = !mode_2612;
   //mode_2612 = true;
@@ -233,12 +237,19 @@ void ym_test() {
   /* Program loop */
   ym_reset();
   const int noteDelay = 100;
-  const uint16_t notes[4] = {0x248C, 0x2368, 0x22DD, 0x1C8C};
-  for(int i=0;i<32;i++) {
-    uint8_t chip = (i/6)%5+1;
+  const uint16_t notes[6] = {
+     getNote(4,1164), getNote(4,872), getNote(4,733), // 473.0437, 354.3764, 297.8875 hz
+     getNote(3,1164), getNote(3,872), getNote(3,733)  // 236.5218, 177.1882, 148.9437
+     };
+  //const uint16_t notes[6] = {0x248C, 0x2368, 0x22DD, 0x1C8C, 0x1B68, 0x1ADD};
+  for (int c=0; c<4; c++) {
+    for(int i=0; i<6; i++) {
+      //uint8_t chip = (i/4)%4+1;
 
-    ym_play(chip, i%6, notes[i%4]);
-    delay(noteDelay);
+      ym_reset();
+      ym_play(c+1, i, notes[i]);
+      delay(noteDelay);
+    }
   }
 }
 
