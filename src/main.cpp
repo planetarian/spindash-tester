@@ -1,20 +1,31 @@
 #include <Arduino.h>
 
-#define PIN_YM_WR (2u)
-#define PIN_YM_RD (3u)
-#define PIN_YM_A0 (4u)
-#define PIN_YM_A1 (5u)
-#define PIN_YM_DATA_OFFSET (6u)
-#define PIN_YM_DATA_LENGTH (8u)
-#define PIN_YM_CSN_OFFSET (16u)
-#define PIN_YM_CSN_LENGTH (5u)
-#define PIN_YM_CS (14u)
-#define PIN_YM_IC (15u)
-#define PIN_YM_MODE_2612 (22u)
-#define ym_data_mask(b) (((b)&0xff)<<PIN_YM_DATA_OFFSET)
-#define ym_csn_mask(b) (((b)&0b11111)<<PIN_YM_CSN_OFFSET)
-#define bit_mask(value, bit) ((value)<<(bit))
+#define YM_COUNT 9     // number of virtualized chips to control
+#define YM_CHANNELS 6  // number of channels per chip
 
+#define PIN_YM_WR (2u) // set low to write DATA to the chip
+#define PIN_YM_RD (3u) // set low to read DATA from the chip
+#define PIN_YM_A0 (4u) // 0: select register; 1: write data
+#define PIN_YM_A1 (5u) // 0: channels 1-3; 1: channels 4-6
+#define PIN_YM_DATA_OFFSET (6u) // register/data to write or read during register operations
+#define PIN_YM_DATA_LENGTH (8u)
+#define PIN_YM_CSN_OFFSET (16u) // chip select: 0: none; 1-31: chip index
+#define PIN_YM_CSN_LENGTH (5u)
+#define PIN_YM_CS (14u) // Not currently observed by the FPGA
+#define PIN_YM_IC (15u) // reset (note: jt12 is reset HIGH)
+#define PIN_YM_MODE_2612 (22u) // 0: YM3438; 1: YM2612
+
+#define YM_A0_REG (false)
+#define YM_A0_DATA (true)
+
+#define bit_mask(value, bit) ((value)<<(bit))
+// mask specific bits at the DATA offset
+#define ym_data_mask(b) (((b)&0xff)<<PIN_YM_DATA_OFFSET)
+// mask specific bits at the CSN offset
+#define ym_csn_mask(b) (((b)&0b11111)<<PIN_YM_CSN_OFFSET)
+
+// just for convenience and because i can't be bothered
+// to find a better way to handle arbitrary nano-scale delays
 #define _n() __NOP()
 #define delay20Ns() _n();_n();_n();
 #define delay50Ns() _n();_n();_n();_n();_n();_n();_n();
@@ -27,15 +38,17 @@
 #define delay800Ns() delay600Ns();delay200Ns();
 #define delay12Clocks() delay500Ns();delay200Ns();delay200Ns();
 #define ym_datamode_wait() delay500Ns();delay200Ns();delay50Ns();
-#define A0_REG (false)
-#define A0_DATA (true)
 
 #define GPIO_IN_REG (SIO_BASE + 0x004)
 #define gpio_read(pin) (((*(uint32_t*)GPIO_IN_REG) << (31-pin)) >> 31)
 
-bool data_is_out = true;
-bool mode_2612 = false;
+/// @brief 2612 mode emulates the ladder distortion of the YM2612
+bool ymMode2612 = false;
 
+/// @brief DATA pins are bidirectional, make sure they're prepared appropriately with ym_datamode_*
+bool ymDataIsOut = true;
+
+/// @brief mask of all pins to be initialized as outputs
 uint32_t outPinsMask
   = ym_data_mask(0xff) | ym_csn_mask(0b11111)
   | bit(PIN_YM_WR) | bit(PIN_YM_RD)
@@ -43,18 +56,20 @@ uint32_t outPinsMask
   | bit(PIN_YM_CS) | bit(PIN_YM_IC)
   | bit(PIN_YM_MODE_2612) | bit(PIN_LED);
 
+/// @brief sets the DATA pins as outputs for use with WR
 void ym_datamode_out() {
-  if (!data_is_out) {
+  if (!ymDataIsOut) {
     ym_datamode_wait();
     gpio_set_dir_masked(ym_data_mask(0xff), ym_data_mask(0xff));
-    data_is_out = true;
+    ymDataIsOut = true;
   }
 }
+/// @brief sets the DATA pins as inputs for use with RD
 void ym_datamode_in() {
-  if (data_is_out) {
+  if (ymDataIsOut) {
     ym_datamode_wait();
     gpio_set_dir_masked(ym_data_mask(0xff), 0);
-    data_is_out = false;
+    ymDataIsOut = false;
   }
 }
 
@@ -73,10 +88,15 @@ WR high (1us)
 CS high
 */
 
+/// @brief clears the DATA output byte
 void ym_cleardata() {
   gpio_put_masked(ym_data_mask(0xff), 0);
 }
 
+/// @brief write data to YM chip (by spec)
+/// @param a0 0: set address; 1: write data
+/// @param a1 0: channels 1-3; 1: channels 4-6
+/// @param data address/data byte to write
 void ym_write(bool a0, uint8_t a1, uint8_t data) {
   // A0 (select/write register)
   // A1 (0: ch1-3, 1: ch4-6)
@@ -100,6 +120,11 @@ void ym_write(bool a0, uint8_t a1, uint8_t data) {
   gpio_set_mask(bit(PIN_YM_WR) | bit(PIN_YM_CS));
 }
 
+/// @brief write data to YM chip (fastest by observed timings)
+/// @param chip 0: none; 1-31: chip index
+/// @param a0 0: set address; 1: write data
+/// @param a1 0: channels 1-3; 1: channels 4-6
+/// @param data address/data byte to write
 void ym_write_jt(uint8_t chip, bool a0, uint8_t a1, uint8_t data) {
   // A0 (select/write register)
   // A1 (0: ch1-3, 1: ch4-6)
@@ -127,6 +152,11 @@ void ym_write_jt(uint8_t chip, bool a0, uint8_t a1, uint8_t data) {
   delay20Ns();
 }
 
+/// @brief write data to one of a chip's registers
+/// @param chip 0: none; 1-31: chip index
+/// @param reg register address to write
+/// @param data data byte to write to register
+/// @param part 0: channels 1-3; 1: channels 4-6
 void ym_write_reg(uint8_t chip, uint8_t reg, uint8_t data, uint8_t part = 0) {
   //gpio_clr_mask(bit(PIN_LED));
 
@@ -134,11 +164,11 @@ void ym_write_reg(uint8_t chip, uint8_t reg, uint8_t data, uint8_t part = 0) {
   ym_datamode_out();
 
   // A0 low (select register)
-	ym_write_jt(chip, A0_REG, part, reg);
+	ym_write_jt(chip, YM_A0_REG, part, reg);
   // Delay between selecting register and writing data
   delay12Clocks();
   // A0 high (write data to register)
-	ym_write_jt(chip, A0_DATA, part, data);
+	ym_write_jt(chip, YM_A0_DATA, part, data);
 
   // After writing data, we need to wait a little before the next write
   // Wait time depends on which register we wrote to
@@ -155,32 +185,52 @@ void ym_write_reg(uint8_t chip, uint8_t reg, uint8_t data, uint8_t part = 0) {
   //gpio_set_mask(bit(PIN_LED));
 }
 
-void ym_reset() {
+/// @brief reset a single YM chip
+/// @param chip 0: none; 1-31: chip index
+void ym_reset(uint16_t chip) {
   gpio_clr_mask(bit(PIN_LED));
   
   gpio_clr_mask(bit(PIN_YM_CS) | bit(PIN_YM_A0) | bit(PIN_YM_A1));
   gpio_set_mask(bit(PIN_YM_WR) | bit(PIN_YM_RD) | bit(PIN_YM_IC));
+  
+  gpio_put_masked(ym_csn_mask(0b11111), ym_csn_mask(chip&0b11111));
+  
   delay12Clocks();
+
   gpio_clr_mask(bit(PIN_YM_IC));
   gpio_set_mask(bit(PIN_YM_CS));
 
   gpio_set_mask(bit(PIN_LED));
 }
 
+/// @brief reset all YM chips
+void ym_reset_all() {
+  for (int i = 0; i < YM_COUNT; i++)
+    ym_reset(i);
+}
+
+/// @brief prepare a YM chip/channel to play a simple e-piano test sound
+/// @param chip 0: none; 1-31: chip index
+/// @param channel 0-5: channel to configure
 void ym_prepare(uint8_t chip, uint8_t channel) {
+  // channels are split into two parts
   const bool part = channel > 2;
+  // by parts, 0-2 and 3-5 have the same indices
   const uint8_t chMod = channel % 3;
-  if (part) channel += 1; // 0 1 2  4 5 6
+  // for keyon/off, first bit in binary representation is the part
+  // ch1-3: 000 001 010 (0-2)
+  // ch4-6: 100 101 110 (4-6)
+  if (part) channel += 1;
   
-  // Global registers
-  ym_write_reg(chip, 0x22, 0x00); // GLOBAL: LFO off
-  //ym_write_reg(chip, 0x24, 0x00); // GLOBAL: Timer A Freq (high)
-  //ym_write_reg(chip, 0x25, 0x00); // GLOBAL: Timer A Freq (low)
-  //ym_write_reg(chip, 0x26, 0x00); // GLOBAL: Timer B Freq
-  ym_write_reg(chip, 0x27, 0x00); // GLOBAL: Ch3 mode normal + timer off
-  ym_write_reg(chip, 0x28, channel); // GLOBAL: Note off
-  //ym_write_reg(chip, 0x29, 0x00); // GLOBAL: Ch6 DAC output
-  ym_write_reg(chip, 0x2B, 0x00); // GLOBAL: Ch6 DAC off
+  // Global registers (no part value)
+  ym_write_reg(chip, 0x22, 0x00); // LFO off
+  //ym_write_reg(chip, 0x24, 0x00); // Timer A Freq (high)
+  //ym_write_reg(chip, 0x25, 0x00); // Timer A Freq (low)
+  //ym_write_reg(chip, 0x26, 0x00); // Timer B Freq
+  ym_write_reg(chip, 0x27, 0x00); // Ch3 mode normal + timer off
+  ym_write_reg(chip, 0x28, channel); // Note off
+  //ym_write_reg(chip, 0x29, 0x00); // Ch6 DAC output
+  ym_write_reg(chip, 0x2B, 0x00); // Ch6 DAC off
 
   // Operator registers
   ym_write_reg(chip, 0x30+chMod, 0x71, part); // OP1 DeTune / MULtiply (DT/MUL)
@@ -213,40 +263,48 @@ void ym_prepare(uint8_t chip, uint8_t channel) {
   ym_write_reg(chip, 0x9C+chMod, 0x00, part); // OP4
 
   // Channel registers
-  ym_write_reg(chip, 0xA0+chMod, 0x69, part); // frequency (low)
-  ym_write_reg(chip, 0xA4+chMod, 0x22, part); // frequency (high)
+  ym_write_reg(chip, 0xA4+chMod, 0x22, part); // block/fnum (high)
+  ym_write_reg(chip, 0xA0+chMod, 0x69, part); // fnum (low)
   ym_write_reg(chip, 0xB0+chMod, 0x32, part); // Feedback/algorithm
   ym_write_reg(chip, 0xB4+chMod, 0xC0, part); // Pan/PMS/AMS
 }
 
+/// @brief play a note on a chip/channel using a simple e-piano test sound
+/// @param chip 0: none; 1-31: chip index
+/// @param channel 0-5: channel to play the note on
+/// @param note two-byte YM block+fnum note value to send
 void ym_play(uint8_t chip, uint8_t channel, uint16_t note) {
   ym_prepare(chip, channel);
-  ym_write_reg(chip, 0xA4 + channel % 3, note >> 8, channel > 2); // frequency (high)
-  ym_write_reg(chip, 0xA0 + channel % 3, note & 0xff, channel > 2); // frequency (low)
+  ym_write_reg(chip, 0xA4 + channel % 3, note >> 8, channel > 2); // block/fnum (high)
+  ym_write_reg(chip, 0xA0 + channel % 3, note & 0xff, channel > 2); // fnum (low)
   ym_write_reg(chip, 0x28, 0xF0 + channel + (channel > 2 ? 1 : 0)); // Key on
 }
 
-uint16_t getNote(uint8_t octave, uint16_t fnum) {
+/// @brief gets the two-byte YM block+fnum value to send for selecting a note frequency
+/// @param octave 0-8: note block
+/// @param fnum fnum for the note within the block
+/// @return two-byte YM block+fnum note value
+uint16_t ym_get_note(uint8_t octave, uint16_t fnum) {
   return ((octave & 7) << 11) | (fnum & 0x7ff);
 }
 
+/// @brief sweeps through all active chips/channels, playing a six-note pattern across each chip.
 void ym_test() {
-  //mode_2612 = !mode_2612;
-  //mode_2612 = true;
-  //gpio_put(PIN_YM_MODE_2612, mode_2612);
+  // not implemented
+  //ymMode2612 = !ymMode2612;
+  //ymMode2612 = true;
+  //gpio_put(PIN_YM_MODE_2612, ymMode2612);
   /* Program loop */
-  ym_reset();
-  const int noteDelay = 100;
-  const uint16_t notes[6] = {
-     getNote(4,1164), getNote(4,872), getNote(4,733), // 473.0437, 354.3764, 297.8875 hz
-     getNote(3,1164), getNote(3,872), getNote(3,733)  // 236.5218, 177.1882, 148.9437
-     };
-  //const uint16_t notes[6] = {0x248C, 0x2368, 0x22DD, 0x1C8C, 0x1B68, 0x1ADD};
-  for (int c=0; c<4; c++) {
-    for(int i=0; i<6; i++) {
-      //uint8_t chip = (i/4)%4+1;
+  
+  ym_reset_all();
 
-      ym_reset();
+  const int noteDelay = 150;
+  const uint16_t notes[YM_CHANNELS] = {
+     ym_get_note(4,1164), ym_get_note(4,872), ym_get_note(4,733), // 473.0437, 354.3764, 297.8875 hz
+     ym_get_note(3,1164), ym_get_note(3,872), ym_get_note(3,733)  // 236.5218, 177.1882, 148.9437
+     };
+  for (int c=0; c<YM_COUNT; c++) {
+    for(int i=0; i<YM_CHANNELS; i++) {
       ym_play(c+1, i, notes[i]);
       delay(noteDelay);
     }
@@ -257,17 +315,17 @@ void setup() {
   gpio_init_mask(outPinsMask);
   gpio_set_dir_masked(outPinsMask, outPinsMask);
   gpio_set_mask(bit(PIN_LED));
-  ym_reset();
+
+  ym_reset_all();
 
   Serial.begin(115200);
   Serial.println("initialized.");
 
   delay(1000);
-  
 }
 
 void loop() {
-  Serial.println("loop start");
+  //Serial.println("loop start");
   ym_test();
   //delay(100);
 }
