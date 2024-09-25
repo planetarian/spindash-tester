@@ -231,6 +231,15 @@ void ym_prepare(uint8_t chip, uint8_t channel) {
   ym_write_reg(chip, 0x28, channel); // Note off
   //ym_write_reg(chip, 0x29, 0x00); // Ch6 DAC output
   ym_write_reg(chip, 0x2B, 0x00); // Ch6 DAC off
+  // jt12-specific registers
+  // 0x00: ADPCMA_ON
+  // 0x01: ADPCMA_TL
+  // 0x02: ADPCMA_TEST
+  // 0x21: TESTYM
+  // 0x2C: DACTEST
+  // 0x2D: CLK_N6
+  // 0x2E: CLK_N3
+  // 0x2F: CLK_N2
 
   // Operator registers
   ym_write_reg(chip, 0x30+chMod, 0x71, part); // OP1 DeTune / MULtiply (DT/MUL)
